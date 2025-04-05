@@ -18,13 +18,15 @@ import {
   SelectItem,
   Spinner,
   Chip,
-  Tabs,
-  Tab,
+  Switch,
+  Tooltip,
 } from "@nextui-org/react";
 import { useEffect, useRef, useState } from "react";
-import { useMemoizedFn, usePrevious } from "ahooks";
+import { useMemoizedFn } from "ahooks";
+import { Microphone, MicrophoneSlash } from "@phosphor-icons/react";
 
 import InteractiveAvatarTextInput from "./InteractiveAvatarTextInput";
+import { SpeechToText } from "@/app/lib/speechToText";
 
 import { AVATARS, STT_LANGUAGE_LIST } from "@/app/lib/constants";
 
@@ -36,13 +38,46 @@ export default function InteractiveAvatar() {
   const [knowledgeId, setKnowledgeId] = useState<string>("");
   const [avatarId, setAvatarId] = useState<string>("");
   const [language, setLanguage] = useState<string>("en");
+  const [isAutoMode, setIsAutoMode] = useState(false);
+  const [conversationHistory, setConversationHistory] = useState<{ role: string; content: string }[]>([]);
+  const [isListening, setIsListening] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
 
   const [data, setData] = useState<StartAvatarResponse>();
   const [text, setText] = useState<string>("");
   const mediaStream = useRef<HTMLVideoElement>(null);
   const avatar = useRef<StreamingAvatar | null>(null);
-  const [chatMode, setChatMode] = useState("text_mode");
-  const [isUserTalking, setIsUserTalking] = useState(false);
+  const speechToText = useRef<SpeechToText | null>(null);
+
+  // Initialize speech-to-text
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      speechToText.current = new SpeechToText();
+      setSpeechSupported(speechToText.current.isSupported());
+      
+      if (speechToText.current) {
+        speechToText.current.onResult((transcript) => {
+          setText(transcript);
+          setIsListening(false);
+        });
+        
+        speechToText.current.onError((error) => {
+          setDebug(error);
+          setIsListening(false);
+        });
+        
+        speechToText.current.onEnd(() => {
+          setIsListening(false);
+        });
+      }
+    }
+    
+    return () => {
+      if (speechToText.current && speechToText.current.isActive()) {
+        speechToText.current.stopListening();
+      }
+    };
+  }, []);
 
   function baseApiUrl() {
     return process.env.NEXT_PUBLIC_BASE_API_URL;
@@ -54,14 +89,10 @@ export default function InteractiveAvatar() {
         method: "POST",
       });
       const token = await response.text();
-
-      console.log("Access Token:", token); // Log the token to verify
-
       return token;
     } catch (error) {
       console.error("Error fetching access token:", error);
     }
-
     return "";
   }
 
@@ -87,95 +118,104 @@ export default function InteractiveAvatar() {
       console.log(">>>>> Stream ready:", event.detail);
       setStream(event.detail);
     });
-    avatar.current?.on(StreamingEvents.USER_START, (event) => {
-      console.log(">>>>> User started talking:", event);
-      setIsUserTalking(true);
-    });
-    avatar.current?.on(StreamingEvents.USER_STOP, (event) => {
-      console.log(">>>>> User stopped talking:", event);
-      setIsUserTalking(false);
-    });
+
     try {
       const res = await avatar.current.createStartAvatar({
         quality: AvatarQuality.Low,
         avatarName: avatarId,
-        knowledgeId: knowledgeId, // Or use a custom `knowledgeBase`.
+        knowledgeId: knowledgeId,
         voice: {
-          rate: 1.5, // 0.5 ~ 1.5
+          rate: 1.5,
           emotion: VoiceEmotion.EXCITED,
-          // elevenlabsSettings: {
-          //   stability: 1,
-          //   similarity_boost: 1,
-          //   style: 1,
-          //   use_speaker_boost: false,
-          // },
         },
         language: language,
         disableIdleTimeout: true,
       });
 
       setData(res);
-      // default to voice mode
-      await avatar.current?.startVoiceChat({
-        useSilencePrompt: false,
-      });
-      setChatMode("voice_mode");
     } catch (error) {
       console.error("Error starting avatar session:", error);
     } finally {
       setIsLoadingSession(false);
     }
   }
+
+  async function getGeminiResponse(prompt: string): Promise<string> {
+    try {
+      const response = await fetch("/api/gemini", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ prompt }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data.response;
+    } catch (error) {
+      console.error("Error getting Gemini response:", error);
+      return "Sorry, I couldn't generate a response at the moment.";
+    }
+  }
+
   async function handleSpeak() {
     setIsLoadingRepeat(true);
     if (!avatar.current) {
       setDebug("Avatar API not initialized");
-
       return;
     }
-    // speak({ text: text, task_type: TaskType.REPEAT })
-    await avatar.current
-      .speak({ text: text, taskType: TaskType.REPEAT, taskMode: TaskMode.SYNC })
-      .catch((e) => {
-        setDebug(e.message);
-      });
-    setIsLoadingRepeat(false);
+
+    try {
+      // Get response from Gemini
+      const geminiResponse = await getGeminiResponse(text);
+      
+      // Update conversation history
+      setConversationHistory(prev => [
+        ...prev,
+        { role: "user", content: text },
+        { role: "assistant", content: geminiResponse }
+      ]);
+
+      // Make avatar speak the response
+      await avatar.current
+        .speak({ text: geminiResponse, taskType: TaskType.REPEAT, taskMode: TaskMode.SYNC })
+        .catch((e) => {
+          setDebug(e.message);
+        });
+
+      // If in auto mode, automatically send the next message after a delay
+      if (isAutoMode) {
+        setTimeout(() => {
+          setText(geminiResponse);
+          handleSpeak();
+        }, 2000); // 2 second delay between messages
+      }
+    } catch (error) {
+      console.error("Error in handleSpeak:", error);
+      setDebug("Error processing response");
+    } finally {
+      setIsLoadingRepeat(false);
+    }
   }
+
   async function handleInterrupt() {
     if (!avatar.current) {
       setDebug("Avatar API not initialized");
-
       return;
     }
     await avatar.current.interrupt().catch((e) => {
       setDebug(e.message);
     });
   }
+
   async function endSession() {
     await avatar.current?.stopAvatar();
     setStream(undefined);
   }
-
-  const handleChangeChatMode = useMemoizedFn(async (v) => {
-    if (v === chatMode) {
-      return;
-    }
-    if (v === "text_mode") {
-      avatar.current?.closeVoiceChat();
-    } else {
-      await avatar.current?.startVoiceChat();
-    }
-    setChatMode(v);
-  });
-
-  const previousText = usePrevious(text);
-  useEffect(() => {
-    if (!previousText && text) {
-      avatar.current?.startListening();
-    } else if (previousText && !text) {
-      avatar?.current?.stopListening();
-    }
-  }, [text, previousText]);
 
   useEffect(() => {
     return () => {
@@ -192,6 +232,21 @@ export default function InteractiveAvatar() {
       };
     }
   }, [mediaStream, stream]);
+
+  const toggleListening = () => {
+    if (!speechToText.current) return;
+    
+    if (isListening) {
+      speechToText.current.stopListening();
+      setIsListening(false);
+    } else {
+      const started = speechToText.current.startListening();
+      if (started) {
+        setIsListening(true);
+        setDebug("Listening...");
+      }
+    }
+  };
 
   return (
     <div className="w-full flex flex-col gap-4">
@@ -249,95 +304,79 @@ export default function InteractiveAvatar() {
                   value={avatarId}
                   onChange={(e) => setAvatarId(e.target.value)}
                 />
+                <p className="text-sm font-medium leading-none">Language</p>
                 <Select
-                  placeholder="Or select one from these example avatars"
-                  size="md"
-                  onChange={(e) => {
-                    setAvatarId(e.target.value);
-                  }}
-                >
-                  {AVATARS.map((avatar) => (
-                    <SelectItem
-                      key={avatar.avatar_id}
-                      textValue={avatar.avatar_id}
-                    >
-                      {avatar.name}
-                    </SelectItem>
-                  ))}
-                </Select>
-                <Select
-                  label="Select language"
-                  placeholder="Select language"
-                  className="max-w-xs"
-                  selectedKeys={[language]}
-                  onChange={(e) => {
-                    setLanguage(e.target.value);
-                  }}
+                  placeholder="Select a language"
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value)}
                 >
                   {STT_LANGUAGE_LIST.map((lang) => (
-                    <SelectItem key={lang.key}>{lang.label}</SelectItem>
+                    <SelectItem key={lang.key} value={lang.value}>
+                      {lang.label}
+                    </SelectItem>
                   ))}
                 </Select>
               </div>
               <Button
-                className="bg-gradient-to-tr from-indigo-500 to-indigo-300 w-full text-white"
-                size="md"
+                className="bg-gradient-to-tr from-indigo-500 to-indigo-300 text-white rounded-lg"
+                size="lg"
                 variant="shadow"
                 onClick={startSession}
               >
-                Start session
+                Start Session
               </Button>
             </div>
           ) : (
-            <Spinner color="default" size="lg" />
+            <div className="h-full justify-center items-center flex flex-col gap-4">
+              <Spinner size="lg" />
+              <p className="text-sm text-default-500">Starting session...</p>
+            </div>
           )}
         </CardBody>
-        <Divider />
-        <CardFooter className="flex flex-col gap-3 relative">
-          <Tabs
-            aria-label="Options"
-            selectedKey={chatMode}
-            onSelectionChange={(v) => {
-              handleChangeChatMode(v);
-            }}
-          >
-            <Tab key="text_mode" title="Text mode" />
-            <Tab key="voice_mode" title="Voice mode" />
-          </Tabs>
-          {chatMode === "text_mode" ? (
-            <div className="w-full flex relative">
-              <InteractiveAvatarTextInput
-                disabled={!stream}
-                input={text}
-                label="Chat"
-                loading={isLoadingRepeat}
-                placeholder="Type something for the avatar to respond"
-                setInput={setText}
-                onSubmit={handleSpeak}
-              />
-              {text && (
-                <Chip className="absolute right-16 top-3">Listening</Chip>
-              )}
-            </div>
-          ) : (
-            <div className="w-full text-center">
-              <Button
-                isDisabled={!isUserTalking}
-                className="bg-gradient-to-tr from-indigo-500 to-indigo-300 text-white"
-                size="md"
-                variant="shadow"
-              >
-                {isUserTalking ? "Listening" : "Voice chat"}
-              </Button>
-            </div>
-          )}
-        </CardFooter>
       </Card>
-      <p className="font-mono text-right">
-        <span className="font-bold">Console:</span>
-        <br />
-        {debug}
-      </p>
+      {stream && (
+        <Card>
+          <CardBody className="flex flex-col gap-4">
+            <div className="flex justify-between items-center">
+              <div className="flex-1">
+                <InteractiveAvatarTextInput
+                  label="Text Input"
+                  placeholder="Type your message..."
+                  input={text}
+                  onSubmit={handleSpeak}
+                  setInput={setText}
+                  loading={isLoadingRepeat}
+                />
+              </div>
+              {speechSupported && (
+                <Tooltip content={isListening ? "Stop listening" : "Start listening"}>
+                  <Button
+                    isIconOnly
+                    color={isListening ? "danger" : "primary"}
+                    variant="flat"
+                    aria-label={isListening ? "Stop listening" : "Start listening"}
+                    onClick={toggleListening}
+                    className="ml-2"
+                  >
+                    {isListening ? <MicrophoneSlash size={20} /> : <Microphone size={20} />}
+                  </Button>
+                </Tooltip>
+              )}
+              <Switch
+                isSelected={isAutoMode}
+                onValueChange={setIsAutoMode}
+                size="sm"
+                className="ml-2"
+              >
+                Auto Mode
+              </Switch>
+            </div>
+            {debug && (
+              <p className="text-sm text-default-500">{debug}</p>
+            )}
+          </CardBody>
+        </Card>
+      )}
     </div>
   );
 }
